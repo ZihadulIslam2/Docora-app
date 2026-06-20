@@ -1,0 +1,418 @@
+import 'package:Docora/l10n/app_localizations.dart';
+import 'package:Docora/screens/patient/profile/add_dependents_screen.dart';
+import 'package:Docora/screens/patient/profile/edit_dependent_screen.dart';
+import 'package:Docora/screens/patient/profile/dependents_list_screen.dart';
+import 'package:Docora/services/call_manager_service.dart';
+import 'package:Docora/services/active_call_state.dart';
+import 'package:Docora/screens/common/calls/video_call_screen.dart';
+import 'package:Docora/screens/common/calls/audio_call_screen.dart';
+import 'package:Docora/services/socket_service.dart';
+import 'package:Docora/screens/patient/notification/patient_notification_screen.dart';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:Docora/screens/patient/navigation/patient_main_navigation.dart';
+import 'package:Docora/screens/doctor/navigation/doctor_main_navigation.dart';
+import 'package:Docora/screens/splash/splash_screen.dart';
+import 'package:Docora/services/api_service.dart';
+import 'package:Docora/services/notification_poller.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:Docora/providers/locale_provider.dart';
+import 'package:Docora/services/notification_service.dart';
+import 'services/auth_service.dart';
+import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+class MyApp extends ConsumerStatefulWidget {
+  const MyApp({super.key});
+
+  @override
+  ConsumerState<MyApp> createState() => _MyAppState();
+}
+
+class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
+  bool _isLoggedIn = false;
+  bool _isLoading = true;
+  String? _userRole;
+  bool _launchingIntoCall = false;
+
+  //  Throttle resume events to prevent excessive data reloads
+  DateTime? _lastResumeTime;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _checkLoginStatus();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    debugPrint('App Lifecycle State: $state');
+
+    if (state == AppLifecycleState.resumed) {
+      //  Throttle — ignore rapid resume events within 30 seconds
+      final now = DateTime.now();
+      if (_lastResumeTime != null &&
+          now.difference(_lastResumeTime!).inSeconds < 30) {
+        debugPrint(
+          '⏳ Resume throttled (${now.difference(_lastResumeTime!).inSeconds}s since last)',
+        );
+        return;
+      }
+      _lastResumeTime = now;
+      debugPrint(' App resumed - Refreshing...');
+
+      if (_isLoggedIn) {
+        NotificationPoller().refreshNotifications();
+
+        SharedPreferences.getInstance().then((prefs) {
+          final uid = prefs.getString('user_id');
+          if (uid != null && !SocketService.instance.isConnected) {
+            SocketService.instance.connect(uid);
+          }
+        });
+
+        _restoreActiveCallIfNeeded();
+      }
+    }
+  }
+
+  Future<void> _restoreActiveCallIfNeeded() async {
+    try {
+      final callData = await ActiveCallState.getActiveCall();
+      if (callData == null) return;
+
+      final navigator = navigatorKey.currentState;
+      if (navigator == null) return;
+
+      debugPrint(
+        'Restoring active call: ${callData['callType']} with ${callData['userName']}',
+      );
+
+      final callType = callData['callType'] ?? 'audio';
+      final chatId = callData['chatId'] ?? '';
+      final userName = callData['userName'] ?? 'Unknown';
+      final userAvatar = callData['userAvatar'];
+      final otherUserId = callData['otherUserId'] ?? '';
+      final isInitiator = callData['isInitiator'] ?? false;
+
+      if (callType == 'video') {
+        navigator.push(
+          MaterialPageRoute(
+            builder: (context) => VideoCallScreen(
+              chatId: chatId,
+              userName: userName,
+              userAvatar: userAvatar,
+              otherUserId: otherUserId,
+              isInitiator: isInitiator,
+            ),
+          ),
+        );
+      } else {
+        navigator.push(
+          MaterialPageRoute(
+            builder: (context) => AudioCallScreen(
+              chatId: chatId,
+              userName: userName,
+              userAvatar: userAvatar,
+              otherUserId: otherUserId,
+              isInitiator: isInitiator,
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint(' Failed to restore active call: $e');
+      await ActiveCallState.clearActiveCall();
+    }
+  }
+
+  Future<void> _checkLoginStatus() async {
+    try {
+      debugPrint(' Checking app login status...');
+
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString('auth_token');
+      final role = prefs.getString('user_role');
+      final userId = prefs.getString('user_id');
+
+      final isLoggedIn = token != null && token.isNotEmpty;
+
+      if (isLoggedIn) {
+        try {
+          final activeCalls = await FlutterCallkitIncoming.activeCalls();
+          if (activeCalls is List && activeCalls.isNotEmpty) {
+            final firstCall = activeCalls.first;
+            final extra = firstCall['extra'];
+            if (extra != null) {
+              Map<String, dynamic> data = {};
+              if (extra is Map) {
+                data = Map<String, dynamic>.from(extra);
+              }
+              if (data['timestamp'] != null) {
+                final callTime = DateTime.parse(data['timestamp']);
+                final diff = DateTime.now().difference(callTime).inMinutes;
+                if (diff <= 2) {
+                  //  Valid active call — skip home screen entirely
+                  _launchingIntoCall = true;
+                  NotificationService.pendingCallData = data;
+                  debugPrint(
+                    ' Valid active call on startup — will skip home screen',
+                  );
+                } else {
+                  await FlutterCallkitIncoming.endAllCalls();
+                  debugPrint(' Stale call ($diff min old) — cleared');
+                }
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint(' Error checking active calls: $e');
+        }
+      }
+
+      setState(() {
+        _isLoggedIn = isLoggedIn;
+        _userRole = role?.toLowerCase();
+        _isLoading = false;
+      });
+
+      if (_isLoggedIn) {
+        debugPrint(' User logged in as: $_userRole');
+
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          if (navigatorKey.currentContext != null) {
+            NotificationService.navigatorKey = navigatorKey;
+            CallManager.instance.initialize(navigatorKey.currentContext!);
+
+            if (NotificationService.consumePendingCallData()) {
+              debugPrint('📞 Navigated directly to call screen (cold start)');
+              if (mounted) setState(() => _launchingIntoCall = false);
+            } else {
+              await NotificationService.checkInitialMessage();
+              NotificationService.consumePendingPayload();
+            }
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint(' Error checking login status: $e');
+      setState(() {
+        _isLoading = false;
+        _isLoggedIn = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentLocale = ref.watch(localeProvider);
+
+    return MaterialApp(
+      navigatorKey: navigatorKey,
+      title: 'Docora',
+      locale: currentLocale,
+      localizationsDelegates: [
+        AppLocalizations.delegate,
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: const [Locale('en'), Locale('ar'), Locale('fr')],
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        useMaterial3: true,
+        textTheme: const TextTheme(
+          bodyLarge: TextStyle(fontSize: 16),
+          bodyMedium: TextStyle(fontSize: 14),
+        ),
+      ),
+      debugShowCheckedModeBanner: false,
+      home: _buildHomeScreen(),
+      routes: {
+        '/splash': (context) => const SplashScreen(),
+        '/patient-home': (context) => const PatientMainNavigation(),
+        '/doctor-home': (context) => const DoctorMainNavigation(),
+        '/dependents-list': (context) => const DependentsListScreen(),
+        '/add-dependent': (context) => const AddDependentScreen(),
+        '/edit-dependent': (context) => const EditDependentScreen(),
+        '/notifications': (context) => const NotificationScreen(),
+      },
+      onGenerateRoute: (settings) {
+        if (settings.name == '/edit-dependent') {
+          return MaterialPageRoute(
+            builder: (context) => const EditDependentScreen(),
+            settings: settings,
+          );
+        }
+        return null;
+      },
+      onUnknownRoute: (settings) {
+        return MaterialPageRoute(builder: (context) => const SplashScreen());
+      },
+    );
+  }
+
+  Widget _buildHomeScreen() {
+    // Loading
+    if (_isLoading) {
+      return const Scaffold(
+        backgroundColor: Colors.white,
+        body: Center(
+          child: CircularProgressIndicator(
+            valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF1664CD)),
+          ),
+        ),
+      );
+    }
+
+    // Not logged in
+    if (!_isLoggedIn) {
+      return const SplashScreen();
+    }
+
+    if (_launchingIntoCall) {
+      debugPrint('📞 Showing call connecting screen (no home screen flash)');
+      return const Scaffold(
+        backgroundColor: Color(0xFF1B2C49),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(color: Colors.white),
+              SizedBox(height: 16),
+              Text(
+                'Connecting to call...',
+                style: TextStyle(color: Colors.white, fontSize: 16),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // Normal navigation
+    switch (_userRole) {
+      case 'doctor':
+        return const DoctorMainNavigation();
+      case 'patient':
+        return const PatientMainNavigation();
+      case 'admin':
+        return const PatientMainNavigation();
+      default:
+        _logout();
+        return Scaffold(
+          backgroundColor: Colors.white,
+          body: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.error_outline, size: 64, color: Colors.orange[700]),
+                const SizedBox(height: 24),
+                const Text(
+                  'Invalid Session',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF1B2C49),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Your session is invalid.\nPlease login again.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                ),
+                const SizedBox(height: 32),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() {
+                      _isLoggedIn = false;
+                      _userRole = null;
+                    });
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1664CD),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32,
+                      vertical: 12,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text(
+                    'Go to Login',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+    }
+  }
+
+  Future<void> _logout() async {
+    try {
+      try {
+        final fcmToken = await FirebaseMessaging.instance.getToken();
+        if (fcmToken != null) {
+          await ApiService.unregisterFCMToken(token: fcmToken);
+          debugPrint(' FCM token deactivated on server');
+        }
+      } catch (e) {
+        debugPrint(' FCM token deactivation failed: $e');
+      }
+
+      if (mounted) {
+        setState(() {
+          _isLoggedIn = false;
+          _userRole = null;
+          _isLoading = false;
+        });
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.clear();
+      await ApiService.clearToken();
+
+      Future.wait([
+        Future(() {
+          NotificationPoller().stopPolling();
+          return NotificationPoller().clearAllData();
+        }),
+        AuthService().logout(),
+        Future(() {
+          SocketService.instance.disconnect();
+        }),
+        Future(() {
+          CallManager.instance.dispose();
+        }),
+      ]).catchError((e) {
+        debugPrint(' Background logout error: $e');
+      });
+    } catch (e) {
+      debugPrint(' Logout error: $e');
+      if (mounted) {
+        setState(() {
+          _isLoggedIn = false;
+          _userRole = null;
+        });
+      }
+    }
+  }
+}
