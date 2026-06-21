@@ -103,7 +103,7 @@ abstract class AppLocalizations {
   /// The title of the application
   ///
   /// In en, this message translates to:
-  /// **'DocMobi'**
+  /// **'Docora'**
   String get appTitle;
 
   /// A welcome message
